@@ -8,6 +8,7 @@
 
 ```bash
 npm run lint
+npm run test:dates
 npm run build
 ```
 

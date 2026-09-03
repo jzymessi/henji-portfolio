@@ -952,6 +952,57 @@ footer {
   font-size: 9px;
   font-style: normal;
 }
+.automation-settings {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px 16px;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #142733;
+}
+.automation-settings > div {
+  display: grid;
+  gap: 4px;
+}
+.automation-settings b {
+  font-size: 11px;
+}
+.automation-settings span,
+.automation-settings small {
+  color: #768893;
+  font-size: 9px;
+}
+.automation-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+}
+.automation-toggle input {
+  accent-color: var(--teal);
+}
+.automation-time {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto 110px;
+  align-items: center;
+  gap: 8px 12px;
+}
+.automation-time input {
+  width: 110px;
+  padding: 8px 10px;
+  border: 1px solid #36505e;
+  border-radius: 8px;
+  background: #0c1b25;
+  color: #dce7ed;
+  color-scheme: dark;
+}
+.automation-time small {
+  grid-column: 1 / -1;
+  line-height: 1.5;
+}
 .settings-modal > p {
   margin: 15px 2px;
   color: #7e909b;

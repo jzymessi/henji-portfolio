@@ -80,6 +80,7 @@ for (const row of rows) {
   );
   if (section === 'pnl') {
     const date = isoDate(record.ToDate || record.FromDate);
+    const openingNav = numeric(record.StartingValue);
     const nav = numeric(record.EndingValue);
     const rate = numeric(record.TWR);
     const cashFlow =
@@ -90,7 +91,16 @@ for (const row of rows) {
     // amount and rate consistent with the dashboard's displayed denominator.
     const pnl = nav * (rate / 100) / (1 + rate / 100);
     if (date && Number.isFinite(nav) && Number.isFinite(rate))
-      daily.push({ date, pnl, nav, rate, cashFlow });
+      daily.push({
+        date,
+        pnl,
+        nav,
+        openingNav,
+        rate,
+        cashFlow,
+        source: 'ibkr-flex-activity',
+        confirmed: true,
+      });
   } else if (section === 'realized' && record.Symbol) {
     const key = record.Conid || record.Symbol;
     const current = realizedBySymbol.get(key) || {

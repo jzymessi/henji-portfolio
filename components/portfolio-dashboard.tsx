@@ -23,6 +23,7 @@ import {
   X,
 } from 'lucide-react';
 import { calculatePositionPnl } from '@/lib/pnl';
+import { usTradingDate } from '@/lib/trading-time.js';
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 
 export type DashboardView = 'overview' | 'ibkr' | 'longbridge';
@@ -51,6 +52,10 @@ type LiveAccount = {
   disabled?: boolean;
   nav?: number;
   dailyPnl?: number | null;
+  dailyRate?: number;
+  dailyOpeningNav?: number;
+  dailySource?: string;
+  dailyConfirmed?: boolean;
   sessionDate?: string;
   sessionLabel?: string;
   positions?: Holding[];
@@ -63,6 +68,9 @@ type DailyReturn = {
   pnl: number;
   nav: number;
   rate: number;
+  openingNav?: number;
+  source?: string;
+  confirmed?: boolean;
   estimated?: boolean;
   cashFlow?: number;
 };
@@ -88,6 +96,16 @@ type LivePayload = {
       rate: number;
       source: 'longbridge-twr';
     }>>;
+  };
+  automation?: {
+    enabled: boolean;
+    time: string;
+    timeZone: 'America/New_York';
+    lastAttemptAt?: string | null;
+    lastRunAt?: string | null;
+    lastRunDate?: string | null;
+    status: 'waiting' | 'running' | 'retrying' | 'partial' | 'success';
+    message: string;
   };
 };
 
@@ -159,6 +177,16 @@ function navHref(view: DashboardView) {
   return view === 'overview' ? '/' : view === 'ibkr' ? '/ibkr' : '/longbridge';
 }
 
+function calendarMonthMeta(year: number, month: number) {
+  const first = new Date(
+    `${year}-${String(month).padStart(2, '0')}-01T00:00:00Z`,
+  );
+  const last = new Date(first);
+  last.setUTCMonth(last.getUTCMonth() + 1);
+  last.setUTCDate(0);
+  return { days: last.getUTCDate(), firstDay: first.getUTCDay() };
+}
+
 function BrokerMark({ broker }: { broker: Broker }) {
   return (
     <span className={`broker-mark ${broker === 'IBKR' ? 'ib' : 'lb'}`}>
@@ -169,19 +197,22 @@ function BrokerMark({ broker }: { broker: Broker }) {
 
 export default function PortfolioDashboard({ view }: { view: DashboardView }) {
   const config = configs[view];
-  const now = new Date();
+  const [initialYear, initialMonth] = usTradingDate().split('-').map(Number);
   const [calendarMode, setCalendarMode] = useState<CalendarMode>('month');
   const [valueMode, setValueMode] = useState<ValueMode>('amount');
-  const [year, setYear] = useState(now.getFullYear());
-  const [month, setMonth] = useState(now.getMonth() + 1);
+  const [year, setYear] = useState(initialYear);
+  const [month, setMonth] = useState(initialMonth);
   const [visible, setVisible] = useState(true);
   const [noticeOpen, setNoticeOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [updatedAt, setUpdatedAt] = useState('尚未手动更新');
-  const [syncText, setSyncText] = useState('仅在点击更新按钮时读取券商数据');
+  const [syncText, setSyncText] = useState('正在读取自动更新状态');
   const [bridgeNonce, setBridgeNonce] = useState(0);
   const [livePortfolio, setLivePortfolio] = useState<LivePayload | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [autoEnabled, setAutoEnabled] = useState(true);
+  const [autoTime, setAutoTime] = useState('16:30');
+  const [savingAutomation, setSavingAutomation] = useState(false);
   const [benchmarkKey, setBenchmarkKey] = useState<BenchmarkKey>('sp500');
   const [comparisonRange, setComparisonRange] = useState<ComparisonRange>('1m');
 
@@ -198,9 +229,15 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
         const payload = (await response.json()) as LivePayload;
         if (active) {
           setLivePortfolio(payload);
+          if (payload.automation) {
+            setAutoEnabled(payload.automation.enabled);
+            setAutoTime(payload.automation.time);
+            if (bridgeNonce === 0) setSyncText(payload.automation.message);
+          }
           if (payload.updatedAt) {
             setUpdatedAt(
               new Date(payload.updatedAt).toLocaleString('zh-CN', {
+                timeZone: 'America/New_York',
                 hour12: false,
               }),
             );
@@ -215,7 +252,7 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
             const failed = selectedAccounts.some((item) => item.refreshError);
             setSyncText(
               failed
-                ? '手动更新已完成，部分已配置账户沿用上次成功缓存'
+                ? '手动更新已完成，部分账户沿用上次成功缓存'
                 : payload.accounts.longbridge.sessionLabel
                   ? `手动更新完成 · 长桥按${payload.accounts.longbridge.sessionLabel}口径归档`
                   : '手动更新完成 · 已保存今日真实账户数据',
@@ -253,8 +290,7 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
   }, [liveAccounts, view]);
 
   const calendarCells = useMemo(() => {
-    const days = new Date(year, month, 0).getDate();
-    const firstDay = new Date(year, month - 1, 1).getDay();
+    const { days, firstDay } = calendarMonthMeta(year, month);
     return [
       ...Array.from({ length: firstDay }, () => null),
       ...Array.from({ length: days }, (_, index) => index + 1),
@@ -270,37 +306,29 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
     const longbridge = new Map((history.longbridge || []).map((item) => [item.date, item]));
     const dates = [...new Set([...ibkr.keys(), ...longbridge.keys()])].sort();
     const lastNav = { ibkr: 0, longbridge: 0 };
-    const initialized = { ibkr: false, longbridge: false };
-    return dates.map((date, index) => {
+    return dates.map((date) => {
       const ibkrItem = ibkr.get(date);
       const longbridgeItem = longbridge.get(date);
-      const previousNav = lastNav.ibkr + lastNav.longbridge;
-      let openingCapital = 0;
-      if (ibkrItem && !initialized.ibkr) {
-        initialized.ibkr = true;
-        openingCapital += ibkrItem.nav;
-      }
-      if (longbridgeItem && !initialized.longbridge) {
-        initialized.longbridge = true;
-        openingCapital += longbridgeItem.nav;
-      }
       if (ibkrItem) lastNav.ibkr = ibkrItem.nav;
       if (longbridgeItem) lastNav.longbridge = longbridgeItem.nav;
       const nav = lastNav.ibkr + lastNav.longbridge;
       const cashFlow =
         (ibkrItem?.cashFlow || 0) +
-        (longbridgeItem?.cashFlow || 0) +
-        openingCapital;
-      const pnl = index === 0
-        ? (ibkrItem?.pnl || 0) + (longbridgeItem?.pnl || 0)
-        : nav - previousNav - cashFlow;
+        (longbridgeItem?.cashFlow || 0);
+      const pnl = (ibkrItem?.pnl || 0) + (longbridgeItem?.pnl || 0);
+      const openingNav =
+        (ibkrItem?.openingNav ??
+          (ibkrItem ? ibkrItem.nav - ibkrItem.pnl : 0)) +
+        (longbridgeItem?.openingNav ??
+          (longbridgeItem ? longbridgeItem.nav - longbridgeItem.pnl : 0));
       return {
         date,
         nav,
         pnl,
         cashFlow,
-        rate: previousNav ? (pnl / previousNav) * 100 : 0,
-        estimated: false,
+        openingNav,
+        rate: openingNav ? (pnl / openingNav) * 100 : 0,
+        estimated: Boolean(ibkrItem?.estimated || longbridgeItem?.estimated),
       };
     });
   }, [livePortfolio?.history, view]);
@@ -442,6 +470,30 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
     setBridgeNonce((value) => value + 1);
   };
 
+  const saveAutomation = async () => {
+    setSavingAutomation(true);
+    try {
+      const response = await fetch('http://127.0.0.1:4318/api/automation', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: autoEnabled, time: autoTime }),
+      });
+      if (!response.ok) throw new Error('保存失败');
+      const payload = (await response.json()) as LivePayload;
+      setLivePortfolio(payload);
+      setSyncText(
+        autoEnabled
+          ? `已开启每日自动更新 · 美东 ${autoTime}`
+          : '每日自动更新已关闭',
+      );
+      setSettingsOpen(false);
+    } catch {
+      setSyncText('无法保存自动更新设置，请确认本地数据桥已启动');
+    } finally {
+      setSavingAutomation(false);
+    }
+  };
+
   const exportCsv = () => {
     const rows = [
       ['Broker', 'Symbol', 'Name', 'Quantity', 'Currency', 'Cost', 'Price'],
@@ -461,7 +513,7 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `${view}-portfolio-2026-${String(month).padStart(2, '0')}.csv`;
+    anchor.download = `${view}-portfolio-${year}-${String(month).padStart(2, '0')}.csv`;
     anchor.click();
     URL.revokeObjectURL(url);
   };
@@ -540,8 +592,8 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
               <b>{isLive ? '正在显示本地真实数据缓存' : '尚未保存券商数据'}</b>
               <p>
                 {isLive
-                  ? '不会后台轮询；只有点击更新按钮才连接已配置券商。日历只展示已保存的真实账户日。'
-                  : '请先配置至少一个券商并启动本地数据桥。页面不会填充任何演示收益。'}
+                  ? `已开启本机每日自动更新；计划时间为美东 ${livePortfolio?.automation?.time || '16:30'}，手动更新仍可随时使用。`
+                  : '请先配置至少一个券商并启动本地数据桥；自动任务会在美东收盘后更新。'}
               </p>
             </div>
             <button aria-label="关闭提示" onClick={() => setNoticeOpen(false)}>
@@ -654,9 +706,11 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
             <button
               className="back-latest"
               onClick={() => {
-                const latest = new Date();
-                setYear(latest.getFullYear());
-                setMonth(latest.getMonth() + 1);
+                const [latestYear, latestMonth] = usTradingDate()
+                  .split('-')
+                  .map(Number);
+                setYear(latestYear);
+                setMonth(latestMonth);
               }}
             >
               <RotateCcw size={15} />
@@ -733,7 +787,7 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
           <section className="calendar-panel">
             <div className="section-heading">
               <div>
-                <span>收益日历（USD）</span>
+                <span>收益日历（USD · 美东交易日）</span>
                 <h2>
                   {year}/{String(month).padStart(2, '0')}
                 </h2>
@@ -773,13 +827,10 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
                 );
                 const amount = entry?.pnl ?? null;
                 const rate = entry?.rate ?? null;
-                const cellDate = new Date(year, month - 1, day);
-                const today = new Date();
-                cellDate.setHours(0, 0, 0, 0);
-                today.setHours(0, 0, 0, 0);
-                const isFuture = cellDate > today;
+                const cellDate = new Date(`${dateKey}T00:00:00Z`);
+                const isFuture = dateKey > usTradingDate();
                 const isWeekend =
-                  cellDate.getDay() === 0 || cellDate.getDay() === 6;
+                  cellDate.getUTCDay() === 0 || cellDate.getUTCDay() === 6;
                 const status = entry
                   ? entry.estimated
                     ? '估算'
@@ -1069,7 +1120,10 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
             <ShieldCheck size={14} />
             只读看板，不请求交易权限
           </span>
-          <span>基准币种 USD · 仅手动更新 · 数据仅供个人记录</span>
+          <span>
+            基准币种 USD · 美东交易日 ·{' '}
+            {autoEnabled ? `每日 ${autoTime} 自动更新` : '仅手动更新'}
+          </span>
         </footer>
       </div>
 
@@ -1120,14 +1174,43 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
                     : '待更新'}
               </em>
             </div>
+            <div className="automation-settings">
+              <div>
+                <b>每日自动更新</b>
+                <span>按美东时间；仅在成功后标记当天已完成</span>
+              </div>
+              <label className="automation-toggle">
+                <input
+                  type="checkbox"
+                  checked={autoEnabled}
+                  onChange={(event) => setAutoEnabled(event.target.checked)}
+                />
+                <span>{autoEnabled ? '已开启' : '已关闭'}</span>
+              </label>
+              <label className="automation-time">
+                <span>更新时间</span>
+                <input
+                  type="time"
+                  min="16:15"
+                  max="19:45"
+                  step="900"
+                  value={autoTime}
+                  disabled={!autoEnabled}
+                  onChange={(event) => setAutoTime(event.target.value)}
+                />
+                <small>建议 16:30–19:45，避免把 20:00 后隔夜盘算入下一交易日。</small>
+              </label>
+            </div>
             <p>
-              页面不会后台轮询；点击更新时才读取账户，并把当天汇总保存到本机。
+              电脑关闭时任务不会运行。再次开机后，长桥会补核对上一交易日；IBKR
+              若已错过 TWS 当日快照，需要 Activity Flex 才能准确补录。
             </p>
             <button
               className="button primary modal-done"
-              onClick={() => setSettingsOpen(false)}
+              onClick={saveAutomation}
+              disabled={savingAutomation}
             >
-              知道了
+              {savingAutomation ? '正在保存…' : '保存设置'}
             </button>
           </dialog>
         </div>

@@ -4,12 +4,20 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import process from 'node:process';
+import {
+  addUtcDays,
+  latestScheduledWeekday,
+  parseClockTime,
+  usTradingDate,
+  usTradingSession,
+} from '../lib/trading-time.js';
 
 const execFileAsync = promisify(execFile);
 const port = Number(process.env.PORTFOLIO_BRIDGE_PORT || 4318);
 const projectRoot = path.resolve(import.meta.dirname, '..');
 const dataDir = path.join(projectRoot, '.data');
 const cachePath = path.join(dataDir, 'portfolio-cache.json');
+const automaticRefreshIntervalMs = 15 * 60 * 1000;
 const enabledBrokers = new Set(
   (process.env.PORTFOLIO_BROKERS || 'ibkr')
     .split(',')
@@ -20,6 +28,36 @@ const allowedOrigins = new Set([
   'http://localhost:3000',
   'http://127.0.0.1:3000',
 ]);
+
+function normalizeAutomaticTime(value) {
+  const fallback = '16:30';
+  const normalized = /^\d{2}:\d{2}$/.test(String(value || ''))
+    ? String(value)
+    : fallback;
+  const minutes = parseClockTime(normalized);
+  return minutes >= 16 * 60 + 15 && minutes <= 19 * 60 + 45
+    ? normalized
+    : fallback;
+}
+
+function normalizeAutomation(value = {}) {
+  return {
+    enabled:
+      typeof value.enabled === 'boolean'
+        ? value.enabled
+        : process.env.PORTFOLIO_AUTO_REFRESH !== '0',
+    time: normalizeAutomaticTime(
+      value.time || process.env.PORTFOLIO_AUTO_REFRESH_TIME,
+    ),
+    timeZone: 'America/New_York',
+    lastAttemptAt: value.lastAttemptAt || null,
+    lastAttemptDate: value.lastAttemptDate || null,
+    lastRunAt: value.lastRunAt || null,
+    lastRunDate: value.lastRunDate || null,
+    status: value.status || 'waiting',
+    message: value.message || '等待美东收盘后的每日自动更新',
+  };
+}
 
 function number(value, fallback = 0) {
   if (value === null || value === undefined || value === '') return fallback;
@@ -54,6 +92,8 @@ async function fetchIbkrFromTws(lifetime) {
     connected: true,
     connection: `tws:${snapshot.port}`,
     updatedAt: new Date().toISOString(),
+    sessionDate: usTradingDate(),
+    sessionLabel: '美东交易日',
     accountId: snapshot.accountId,
     nav: number(snapshot.nav),
     dailyPnl:
@@ -116,7 +156,14 @@ async function longbridgeJson(args) {
   const { stdout } = await execFileAsync(
     command,
     [...args, '--format', 'json'],
-    { timeout: 20000, maxBuffer: 10 * 1024 * 1024 },
+    {
+      env: {
+        ...process.env,
+        LONGBRIDGE_REGION: process.env.LONGBRIDGE_REGION || 'global',
+      },
+      timeout: 20000,
+      maxBuffer: 10 * 1024 * 1024,
+    },
   );
   return JSON.parse(stdout);
 }
@@ -132,12 +179,6 @@ function collectObjects(value, predicate, result = []) {
   return result;
 }
 
-function addUtcDays(date, days) {
-  const value = new Date(`${date}T00:00:00Z`);
-  value.setUTCDate(value.getUTCDate() + days);
-  return value.toISOString().slice(0, 10);
-}
-
 function shiftLocalDate(date, { months = 0, years = 0 } = {}) {
   const value = new Date(`${date}T00:00:00Z`);
   value.setUTCMonth(value.getUTCMonth() - months);
@@ -146,7 +187,7 @@ function shiftLocalDate(date, { months = 0, years = 0 } = {}) {
 }
 
 async function fetchLongbridgePerformanceRanges(previous = {}) {
-  const end = localDate();
+  const end = usTradingDate();
   const starts = {
     today: end,
     month: `${end.slice(0, 7)}-01`,
@@ -175,7 +216,7 @@ async function fetchLongbridgePerformanceRanges(previous = {}) {
 
 async function fetchLongbridgeExternalCashFlows(startDate) {
   const [flows, exchangeRates] = await Promise.all([
-    longbridgeJson(['cash-flow', '--start', startDate, '--end', localDate()]),
+    longbridgeJson(['cash-flow', '--start', startDate, '--end', usTradingDate()]),
     longbridgeJson(['exchange-rate']),
   ]);
   const rates = new Map(
@@ -192,36 +233,6 @@ async function fetchLongbridgeExternalCashFlows(startDate) {
     byDate[date] = number(byDate[date]) + number(item.balance) * rate;
   }
   return byDate;
-}
-
-function usTradingSession(now = new Date()) {
-  const fields = Object.fromEntries(
-    new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'America/New_York',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hourCycle: 'h23',
-    })
-      .formatToParts(now)
-      .filter((part) => part.type !== 'literal')
-      .map((part) => [part.type, part.value]),
-  );
-  const date = `${fields.year}-${fields.month}-${fields.day}`;
-  const minutes = number(fields.hour) * 60 + number(fields.minute);
-  if (minutes >= 20 * 60)
-    return {
-      key: 'overnight',
-      label: '隔夜盘',
-      date: addUtcDays(date, 1),
-    };
-  if (minutes < 4 * 60) return { key: 'overnight', label: '隔夜盘', date };
-  if (minutes < 9 * 60 + 30) return { key: 'pre_market', label: '盘前', date };
-  if (minutes < 16 * 60) return { key: 'regular', label: '常规盘', date };
-  if (minutes < 20 * 60) return { key: 'post_market', label: '盘后', date };
-  return { key: 'regular', label: '常规盘', date };
 }
 
 function isUsOption(symbol) {
@@ -247,13 +258,46 @@ function quoteForSession(quote, session) {
   };
 }
 
+function longbridgeDailyRecord(raw, date) {
+  const pnl = number(raw?.sum_profit, Number.NaN);
+  const nav = number(raw?.ending_asset_value, Number.NaN);
+  const openingNav = number(raw?.initial_asset_value, Number.NaN);
+  const rawRate = number(
+    raw?.total_time_earning_yield ?? raw?.sum_profit_rate,
+    Number.NaN,
+  );
+  if (![pnl, nav, openingNav, rawRate].every(Number.isFinite)) return null;
+  return {
+    date,
+    pnl,
+    nav,
+    openingNav,
+    rate: rawRate * 100,
+    source: 'longbridge-official',
+    confirmed: true,
+  };
+}
+
+async function fetchLongbridgeDaily(date) {
+  const raw = await longbridgeJson([
+    'profit-analysis',
+    '--start',
+    date,
+    '--end',
+    date,
+  ]);
+  return longbridgeDailyRecord(raw, date);
+}
+
 async function fetchLongbridge() {
   if (!enabledBrokers.has('longbridge'))
     return { connected: false, disabled: true, positions: [] };
   try {
-    const [portfolioRaw, profitRaw] = await Promise.all([
+    const session = usTradingSession();
+    const [portfolioRaw, profitRaw, officialDaily] = await Promise.all([
       longbridgeJson(['portfolio']),
       longbridgeJson(['profit-analysis']).catch(() => ({})),
+      fetchLongbridgeDaily(session.date).catch(() => null),
     ]);
     const overview = portfolioRaw?.overview || {};
     const rawPositions = collectObjects(
@@ -274,7 +318,6 @@ async function fetchLongbridge() {
         'symbol' in item &&
         ('pnl' in item || 'profit' in item || 'total_pnl' in item),
     );
-    const session = usTradingSession();
     const extendedDailyPnl = rawPositions.reduce((sum, item) => {
       const quote = quotes.find(
         (candidate) => candidate.symbol === item.symbol,
@@ -295,11 +338,15 @@ async function fetchLongbridge() {
       updatedAt: new Date().toISOString(),
       sessionDate: session.date,
       sessionLabel: session.label,
-      nav: number(overview.total_asset),
-      dailyPnl:
-        session.key === 'regular'
+      nav: officialDaily?.nav ?? number(overview.total_asset),
+      dailyPnl: officialDaily?.pnl ??
+        (session.key === 'regular'
           ? number(overview.total_today_pl)
-          : Number(extendedDailyPnl.toFixed(4)),
+          : Number(extendedDailyPnl.toFixed(4))),
+      dailyRate: officialDaily?.rate,
+      dailyOpeningNav: officialDaily?.openingNav,
+      dailySource: officialDaily?.source || 'longbridge-session-estimate',
+      dailyConfirmed: Boolean(officialDaily),
       positions: rawPositions.map((item) => {
         const underlying = optionUnderlying(item.symbol);
         const profit =
@@ -367,7 +414,7 @@ async function fetchBenchmarks(startDate) {
       try {
         rows = await longbridgeJson([
           'kline', 'history', definition.symbol,
-          '--start', startDate, '--end', localDate(), '--period', 'day',
+          '--start', startDate, '--end', usTradingDate(), '--period', 'day',
         ]);
         break;
       } catch {
@@ -387,15 +434,6 @@ async function fetchBenchmarks(startDate) {
   return Object.fromEntries(entries);
 }
 
-function localDate() {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date());
-}
-
 async function loadCache() {
   try {
     const cached = JSON.parse(await readFile(cachePath, 'utf8'));
@@ -409,6 +447,7 @@ async function loadCache() {
           ? cached.accounts?.longbridge || { connected: false, positions: [] }
           : { connected: false, disabled: true, positions: [] },
       },
+      automation: normalizeAutomation(cached.automation),
     };
   } catch {
     return {
@@ -427,8 +466,15 @@ async function loadCache() {
         },
       },
       history: { ibkr: [], longbridge: [] },
+      automation: normalizeAutomation(),
     };
   }
+}
+
+async function saveCache(payload) {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(cachePath, JSON.stringify(payload, null, 2), 'utf8');
+  return payload;
 }
 
 function updateHistory(history, broker, account) {
@@ -438,12 +484,62 @@ function updateHistory(history, broker, account) {
     account.dailyPnl === undefined
   )
     return history;
-  const date = account.sessionDate || localDate();
+  const date = account.sessionDate || usTradingDate();
   const pnl = number(account.dailyPnl);
   const nav = number(account.nav);
-  const rate = nav - pnl === 0 ? 0 : (pnl / (nav - pnl)) * 100;
+  const openingNav = number(account.dailyOpeningNav, nav - pnl);
+  const rate = Number.isFinite(account.dailyRate)
+    ? account.dailyRate
+    : openingNav === 0
+      ? 0
+      : (pnl / openingNav) * 100;
+  const current = (history?.[broker] || []).find((item) => item.date === date);
+  if (current?.confirmed && !account.dailyConfirmed) return history;
   const items = (history?.[broker] || []).filter((item) => item.date !== date);
-  return { ...history, [broker]: [...items, { date, pnl, nav, rate }] };
+  return {
+    ...history,
+    [broker]: [
+      ...items,
+      {
+        ...current,
+        date,
+        pnl,
+        nav,
+        openingNav,
+        rate,
+        source: account.dailySource || `${broker}-live`,
+        confirmed: Boolean(account.dailyConfirmed),
+      },
+    ].sort((a, b) => a.date.localeCompare(b.date)),
+  };
+}
+
+async function reconcileRecentLongbridgeHistory(history) {
+  const items = history?.longbridge || [];
+  const candidates = items
+    .filter((item) => !item.confirmed)
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(-3);
+  if (!candidates.length) return history;
+
+  const replacements = new Map();
+  for (const item of candidates) {
+    try {
+      const official = await fetchLongbridgeDaily(item.date);
+      if (official)
+        replacements.set(item.date, {
+          ...item,
+          ...official,
+        });
+    } catch {
+      // Keep the existing record when the official daily query is unavailable.
+    }
+  }
+  if (!replacements.size) return history;
+  return {
+    ...history,
+    longbridge: items.map((item) => replacements.get(item.date) || item),
+  };
 }
 
 async function refreshPortfolio(previous) {
@@ -451,9 +547,8 @@ async function refreshPortfolio(previous) {
     ...(previous.history?.ibkr || []),
     ...(previous.history?.longbridge || []),
   ].map((item) => item.date).sort((a, b) => a.localeCompare(b));
-  const oneYearAgo = new Date();
-  oneYearAgo.setUTCFullYear(oneYearAgo.getUTCFullYear() - 1);
-  const benchmarkStart = [historyDates[0], oneYearAgo.toISOString().slice(0, 10)]
+  const oneYearAgo = shiftLocalDate(usTradingDate(), { years: 1 });
+  const benchmarkStart = [historyDates[0], oneYearAgo]
     .filter(Boolean)
     .sort((a, b) => a.localeCompare(b))[0];
   const [freshIbkr, freshLongbridge, freshBenchmarks] = await Promise.all([
@@ -468,15 +563,17 @@ async function refreshPortfolio(previous) {
   const ibkr = freshIbkr.disabled
     ? freshIbkr
     : freshIbkr.connected
-    ? freshIbkr
-    : { ...previous.accounts.ibkr, refreshError: freshIbkr.error };
+      ? freshIbkr
+      : { ...previous.accounts.ibkr, refreshError: freshIbkr.error };
   const longbridge = freshLongbridge.disabled
     ? freshLongbridge
     : freshLongbridge.connected
-    ? freshLongbridge
-    : { ...previous.accounts.longbridge, refreshError: freshLongbridge.error };
+      ? freshLongbridge
+      : { ...previous.accounts.longbridge, refreshError: freshLongbridge.error };
   let history = updateHistory(previous.history, 'ibkr', freshIbkr);
   history = updateHistory(history, 'longbridge', freshLongbridge);
+  if (enabledBrokers.has('longbridge'))
+    history = await reconcileRecentLongbridgeHistory(history);
   const longbridgePerformance = enabledBrokers.has('longbridge')
     ? await fetchLongbridgePerformanceRanges(
         previous.performanceRanges?.longbridge,
@@ -501,10 +598,146 @@ async function refreshPortfolio(previous) {
     history,
     benchmarks: freshBenchmarks,
     performanceRanges: { longbridge: longbridgePerformance },
+    automation: normalizeAutomation(previous.automation),
   };
-  await mkdir(dataDir, { recursive: true });
-  await writeFile(cachePath, JSON.stringify(payload, null, 2), 'utf8');
-  return payload;
+  await saveCache(payload);
+  return {
+    payload,
+    refreshed: {
+      ibkr: Boolean(freshIbkr.connected),
+      longbridge: Boolean(freshLongbridge.connected),
+    },
+  };
+}
+
+let refreshInFlight = null;
+
+async function runPortfolioRefresh() {
+  if (!refreshInFlight) {
+    refreshInFlight = loadCache()
+      .then((cached) => refreshPortfolio(cached))
+      .finally(() => {
+        refreshInFlight = null;
+      });
+  }
+  return refreshInFlight;
+}
+
+function confirmedHistoryDate(payload, broker, date) {
+  return Boolean(
+    payload.history?.[broker]?.some(
+      (item) => item.date === date && item.confirmed,
+    ),
+  );
+}
+
+async function saveAutomationStatus(payload, patch) {
+  const next = {
+    ...payload,
+    automation: normalizeAutomation({
+      ...payload.automation,
+      ...patch,
+    }),
+  };
+  await saveCache(next);
+  return next;
+}
+
+async function automaticRefreshTick(now = new Date()) {
+  let cached = await loadCache();
+  const automation = normalizeAutomation(cached.automation);
+  if (!automation.enabled) return;
+
+  const targetDate = latestScheduledWeekday(now, automation.time);
+  if (automation.lastRunDate === targetDate) return;
+  if (
+    automation.lastAttemptDate === targetDate &&
+    automation.lastAttemptAt &&
+    now.getTime() - new Date(automation.lastAttemptAt).getTime() <
+      automaticRefreshIntervalMs - 1000
+  )
+    return;
+
+  cached = await saveAutomationStatus(cached, {
+    lastAttemptAt: now.toISOString(),
+    lastAttemptDate: targetDate,
+    status: 'running',
+    message: `正在自动更新 ${targetDate} 的账户数据`,
+  });
+
+  const canUseLiveSnapshot = usTradingDate(now) === targetDate;
+  if (canUseLiveSnapshot) {
+    try {
+      const result = await runPortfolioRefresh();
+      const allSucceeded = [...enabledBrokers].every(
+        (broker) => result.refreshed[broker],
+      );
+      await saveAutomationStatus(result.payload, {
+        lastRunAt: allSucceeded ? new Date().toISOString() : automation.lastRunAt,
+        lastRunDate: allSucceeded ? targetDate : automation.lastRunDate,
+        status: allSucceeded ? 'success' : 'retrying',
+        message: allSucceeded
+          ? `${targetDate} 已完成每日自动更新`
+          : '部分券商暂未连接，将在本交易日内自动重试',
+      });
+    } catch (error) {
+      await saveAutomationStatus(await loadCache(), {
+        status: 'retrying',
+        message: `自动更新失败，稍后重试：${error.message}`,
+      });
+    }
+    return;
+  }
+
+  let longbridgeConfirmed =
+    !enabledBrokers.has('longbridge') ||
+    confirmedHistoryDate(cached, 'longbridge', targetDate);
+  if (enabledBrokers.has('longbridge') && !longbridgeConfirmed) {
+    try {
+      const official = await fetchLongbridgeDaily(targetDate);
+      if (official) {
+        cached = {
+          ...cached,
+          history: updateHistory(cached.history, 'longbridge', {
+            connected: true,
+            sessionDate: targetDate,
+            nav: official.nav,
+            dailyPnl: official.pnl,
+            dailyRate: official.rate,
+            dailyOpeningNav: official.openingNav,
+            dailySource: official.source,
+            dailyConfirmed: true,
+          }),
+        };
+        longbridgeConfirmed = true;
+      }
+    } catch {
+      // The status below explains that this date still needs a source record.
+    }
+  }
+  const ibkrConfirmed =
+    !enabledBrokers.has('ibkr') ||
+    confirmedHistoryDate(cached, 'ibkr', targetDate);
+  const complete = ibkrConfirmed && longbridgeConfirmed;
+  await saveAutomationStatus(cached, {
+    lastRunAt: new Date().toISOString(),
+    lastRunDate: targetDate,
+    status: complete ? 'success' : 'partial',
+    message: complete
+      ? `${targetDate} 的历史数据已在开机后核对完成`
+      : enabledBrokers.has('longbridge') && longbridgeConfirmed
+        ? `${targetDate} 长桥已补齐；IBKR 错过 TWS 快照，需用 Activity Flex 补录`
+        : `${targetDate} 已错过本地快照，尚无可用历史数据`,
+  });
+}
+
+async function readJsonBody(request) {
+  let body = '';
+  for await (const chunk of request) {
+    body += chunk;
+    if (body.length > 16 * 1024) throw new Error('Request body is too large');
+  }
+  return body ? JSON.parse(body) : {};
 }
 
 function sendJson(response, status, payload, origin) {
@@ -527,11 +760,31 @@ const server = createServer(async (request, response) => {
       allowedOrigins.has(origin)
         ? {
             'access-control-allow-origin': origin,
-            'access-control-allow-methods': 'GET,OPTIONS',
+            'access-control-allow-methods': 'GET,PUT,OPTIONS',
+            'access-control-allow-headers': 'content-type',
           }
         : {},
     );
     return response.end();
+  }
+  if (request.method === 'PUT' && url.pathname === '/api/automation') {
+    try {
+      const body = await readJsonBody(request);
+      const cached = await loadCache();
+      const automation = normalizeAutomation({
+        ...cached.automation,
+        enabled: body.enabled,
+        time: body.time,
+        status: 'waiting',
+        message: body.enabled
+          ? '自动更新时间已保存'
+          : '每日自动更新已关闭',
+      });
+      const payload = await saveCache({ ...cached, automation });
+      return sendJson(response, 200, payload, origin);
+    } catch (error) {
+      return sendJson(response, 400, { error: error.message }, origin);
+    }
   }
   if (
     request.method !== 'GET' ||
@@ -541,7 +794,7 @@ const server = createServer(async (request, response) => {
   const cached = await loadCache();
   const payload =
     url.pathname === '/api/portfolio' && url.searchParams.get('refresh') === '1'
-      ? await refreshPortfolio(cached)
+      ? (await runPortfolioRefresh()).payload
       : cached;
   sendJson(response, 200, payload, origin);
 });
@@ -549,3 +802,15 @@ const server = createServer(async (request, response) => {
 server.listen(port, '127.0.0.1', () =>
   console.log(`Portfolio bridge listening on http://127.0.0.1:${port}`),
 );
+
+const automaticTimer = setInterval(() => {
+  automaticRefreshTick().catch((error) =>
+    console.error(`[auto-refresh] ${error.message}`),
+  );
+}, automaticRefreshIntervalMs);
+automaticTimer.unref();
+setTimeout(() => {
+  automaticRefreshTick().catch((error) =>
+    console.error(`[auto-refresh] ${error.message}`),
+  );
+}, 1500).unref();

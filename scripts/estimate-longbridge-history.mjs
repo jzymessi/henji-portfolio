@@ -3,15 +3,16 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { promisify } from 'node:util';
+import { usTradingDate } from '../lib/trading-time.js';
 
 const execFileAsync = promisify(execFile);
-const command = process.env.LONGBRIDGE_CLI || 'longbridge';
+const command = process.env.LONGBRIDGE_CLI || '/opt/homebrew/bin/longbridge';
 const root = path.resolve(import.meta.dirname, '..');
 const cachePath = path.join(root, '.data', 'portfolio-cache.json');
 const snapshotPath = path.join(root, '.data', 'longbridge-statement-snapshots.json');
 const pricePath = path.join(root, '.data', 'longbridge-price-history.json');
 const startDate = process.argv[2] || '2026-01-01';
-const endDate = process.argv[3] || new Date().toISOString().slice(0, 10);
+const endDate = process.argv[3] || usTradingDate();
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let nextRequest = 0;
 async function cli(args, timeout = 90000, attempts = 5) {
