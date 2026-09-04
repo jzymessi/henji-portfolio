@@ -137,7 +137,20 @@ for (const date of allDates) {
 }
 
 const cache = JSON.parse(await readFile(cachePath, 'utf8'));
-const existing = (cache.history?.longbridge || []).filter((x) => !estimates.some((e) => e.date === x.date));
-cache.history = { ...cache.history, longbridge: [...existing, ...estimates].sort((a, b) => a.date.localeCompare(b.date)) };
+const officialDates = new Set(
+  (cache.history?.longbridge || [])
+    .filter((item) => item.confirmed && item.source === 'longbridge-official')
+    .map((item) => item.date),
+);
+const safeEstimates = estimates.filter((item) => !officialDates.has(item.date));
+const existing = (cache.history?.longbridge || []).filter(
+  (item) => !safeEstimates.some((estimate) => estimate.date === item.date),
+);
+cache.history = {
+  ...cache.history,
+  longbridge: [...existing, ...safeEstimates].sort((a, b) =>
+    a.date.localeCompare(b.date),
+  ),
+};
 await writeFile(cachePath, JSON.stringify(cache, null, 2), 'utf8');
-console.log(JSON.stringify({ estimatedDays: estimates.length, firstDate: estimates[0]?.date, lastDate: estimates.at(-1)?.date, symbols: symbols.length }));
+console.log(JSON.stringify({ estimatedDays: safeEstimates.length, firstDate: safeEstimates[0]?.date, lastDate: safeEstimates.at(-1)?.date, symbols: symbols.length }));

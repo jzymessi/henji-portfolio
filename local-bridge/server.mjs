@@ -4,6 +4,9 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import process from 'node:process';
+import { reconcileIbkrNavRollover } from '../lib/ibkr-rollover.js';
+import { validateLongbridgeDailyWindow } from '../lib/longbridge-daily.js';
+import { reconcileDailyCashFlows } from '../lib/portfolio-cashflows.js';
 import {
   addUtcDays,
   latestScheduledWeekday,
@@ -205,6 +208,8 @@ async function fetchLongbridgePerformanceRanges(previous = {}) {
         endDate: end,
         pnl: number(raw.sum_profit),
         rate: number(raw.total_time_earning_yield ?? raw.sum_profit_rate) * 100,
+        simpleRate: number(raw.total_simple_earning_yield ?? raw.sum_profit_rate) * 100,
+        initialAssetValue: number(raw.initial_asset_value),
         source: 'longbridge-twr',
       };
     } catch {
@@ -259,6 +264,11 @@ function quoteForSession(quote, session) {
 }
 
 function longbridgeDailyRecord(raw, date) {
+  const window = validateLongbridgeDailyWindow(raw, date);
+  if (!window.valid) {
+    console.warn(`[longbridge:daily] ${date} 未确认：${window.reason}`);
+    return null;
+  }
   const pnl = number(raw?.sum_profit, Number.NaN);
   const nav = number(raw?.ending_asset_value, Number.NaN);
   const openingNav = number(raw?.initial_asset_value, Number.NaN);
@@ -275,6 +285,9 @@ function longbridgeDailyRecord(raw, date) {
     rate: rawRate * 100,
     source: 'longbridge-official',
     confirmed: true,
+    estimated: false,
+    reportedStartDate: raw.start_date,
+    reportedEndDate: raw.end_date,
   };
 }
 
@@ -509,6 +522,7 @@ function updateHistory(history, broker, account) {
         rate,
         source: account.dailySource || `${broker}-live`,
         confirmed: Boolean(account.dailyConfirmed),
+        estimated: !account.dailyConfirmed,
       },
     ].sort((a, b) => a.date.localeCompare(b.date)),
   };
@@ -571,6 +585,8 @@ async function refreshPortfolio(previous) {
       ? freshLongbridge
       : { ...previous.accounts.longbridge, refreshError: freshLongbridge.error };
   let history = updateHistory(previous.history, 'ibkr', freshIbkr);
+  if (enabledBrokers.has('ibkr'))
+    history = reconcileIbkrNavRollover(history, freshIbkr);
   history = updateHistory(history, 'longbridge', freshLongbridge);
   if (enabledBrokers.has('longbridge'))
     history = await reconcileRecentLongbridgeHistory(history);
@@ -585,10 +601,10 @@ async function refreshPortfolio(previous) {
   if (externalFlows) {
     history = {
       ...history,
-      longbridge: (history.longbridge || []).map((item) => ({
-        ...item,
-        cashFlow: number(externalFlows[item.date]),
-      })),
+      longbridge: reconcileDailyCashFlows(
+        history.longbridge || [],
+        externalFlows,
+      ),
     };
   }
   const payload = {

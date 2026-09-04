@@ -23,6 +23,11 @@ import {
   X,
 } from 'lucide-react';
 import { calculatePositionPnl } from '@/lib/pnl';
+import {
+  buildPortfolioReturnPoints,
+  calculateSimpleReturn,
+  combineBrokerDailyHistory,
+} from '@/lib/performance-series.js';
 import { usTradingDate } from '@/lib/trading-time.js';
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 
@@ -94,6 +99,8 @@ type LivePayload = {
       endDate: string;
       pnl: number;
       rate: number;
+      simpleRate?: number;
+      initialAssetValue?: number;
       source: 'longbridge-twr';
     }>>;
   };
@@ -300,37 +307,19 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
   const dailyHistory = useMemo(() => {
     const history = livePortfolio?.history;
     if (!history) return [];
-    if (view === 'ibkr') return history.ibkr || [];
-    if (view === 'longbridge') return history.longbridge || [];
-    const ibkr = new Map((history.ibkr || []).map((item) => [item.date, item]));
-    const longbridge = new Map((history.longbridge || []).map((item) => [item.date, item]));
-    const dates = [...new Set([...ibkr.keys(), ...longbridge.keys()])].sort();
-    const lastNav = { ibkr: 0, longbridge: 0 };
-    return dates.map((date) => {
-      const ibkrItem = ibkr.get(date);
-      const longbridgeItem = longbridge.get(date);
-      if (ibkrItem) lastNav.ibkr = ibkrItem.nav;
-      if (longbridgeItem) lastNav.longbridge = longbridgeItem.nav;
-      const nav = lastNav.ibkr + lastNav.longbridge;
-      const cashFlow =
-        (ibkrItem?.cashFlow || 0) +
-        (longbridgeItem?.cashFlow || 0);
-      const pnl = (ibkrItem?.pnl || 0) + (longbridgeItem?.pnl || 0);
-      const openingNav =
-        (ibkrItem?.openingNav ??
-          (ibkrItem ? ibkrItem.nav - ibkrItem.pnl : 0)) +
-        (longbridgeItem?.openingNav ??
-          (longbridgeItem ? longbridgeItem.nav - longbridgeItem.pnl : 0));
-      return {
-        date,
-        nav,
-        pnl,
-        cashFlow,
-        openingNav,
-        rate: openingNav ? (pnl / openingNav) * 100 : 0,
-        estimated: Boolean(ibkrItem?.estimated || longbridgeItem?.estimated),
-      };
-    });
+    const currentDate = usTradingDate();
+    const usable = (items: DailyReturn[]) =>
+      items.filter(
+        (item) =>
+          item.confirmed !== false ||
+          item.date === currentDate ||
+          item.source === 'ibkr-nav-rollover-estimate',
+      );
+    const ibkrItems = usable(history.ibkr || []);
+    const longbridgeItems = usable(history.longbridge || []);
+    if (view === 'ibkr') return ibkrItems;
+    if (view === 'longbridge') return longbridgeItems;
+    return combineBrokerDailyHistory(ibkrItems, longbridgeItems);
   }, [livePortfolio?.history, view]);
 
   const selectedMonthHistory = useMemo(
@@ -354,13 +343,7 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
     (sum, item) => sum + item.pnl,
     0,
   );
-  const monthRate =
-    (selectedMonthHistory.reduce(
-      (linked, item) => linked * (1 + item.rate / 100),
-      1,
-    ) -
-      1) *
-    100;
+  const monthRate = calculateSimpleReturn(selectedMonthHistory);
   const winDays = selectedMonthHistory.filter((item) => item.pnl > 0).length;
   const lossDays = selectedMonthHistory.filter((item) => item.pnl < 0).length;
   const drawdown = selectedMonthHistory.length
@@ -378,15 +361,15 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
           name,
           hasData: items.length > 0,
           value: items.reduce((sum, item) => sum + item.pnl, 0),
-          rate:
-            (items.reduce((linked, item) => linked * (1 + item.rate / 100), 1) -
-              1) *
-            100,
+          rate: calculateSimpleReturn(items),
         };
       }),
     [dailyHistory, year],
   );
 
+  const officialRange = view === 'longbridge'
+    ? livePortfolio?.performanceRanges?.longbridge?.[comparisonRange]
+    : undefined;
   const comparisonData = useMemo(() => {
     const allBenchmark = livePortfolio?.benchmarks?.[benchmarkKey]?.points || [];
     const latestPortfolio = dailyHistory.map((item) => item.date).sort((a, b) => a.localeCompare(b)).at(-1);
@@ -415,39 +398,34 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
     const portfolio = dailyHistory.filter((item) => item.date >= start && item.date <= latestDate);
     const benchmark = allBenchmark.filter((item) => item.date >= start && item.date <= latestDate);
     const dates = [...new Set([...portfolio.map((item) => item.date), ...benchmark.map((item) => item.date)])].sort();
-    const portfolioByDate = new Map(portfolio.map((item) => [item.date, item]));
+    const portfolioByDate = new Map(
+      buildPortfolioReturnPoints(
+        portfolio,
+        officialRange?.initialAssetValue,
+      ).map((item) => [item.date, item.rate]),
+    );
     const benchmarkByDate = new Map(benchmark.map((item) => [item.date, item.close]));
     const baseline = [...allBenchmark]
       .filter((item) => item.date < start)
       .sort((a, b) => a.date.localeCompare(b.date))
       .at(-1)?.close ?? benchmark[0]?.close;
-    let linked = 1;
     let lastBenchmark = baseline;
+    let lastPortfolio = 0;
     return dates.map((date) => {
       const daily = portfolioByDate.get(date);
-      if (daily) linked *= 1 + daily.rate / 100;
+      lastPortfolio = daily ?? lastPortfolio;
       lastBenchmark = benchmarkByDate.get(date) ?? lastBenchmark;
       return {
         date: date.slice(5).replace('-', '/'),
         fullDate: date,
-        portfolio: (linked - 1) * 100,
+        portfolio: lastPortfolio,
         benchmark: baseline && lastBenchmark ? (lastBenchmark / baseline - 1) * 100 : null,
       };
     });
-  }, [benchmarkKey, comparisonRange, dailyHistory, livePortfolio?.benchmarks]);
-  const officialRange = view === 'longbridge' && comparisonRange !== 'today'
-    ? livePortfolio?.performanceRanges?.longbridge?.[comparisonRange]
-    : undefined;
-  const displayedComparisonData = useMemo(() => {
-    const rawFinal = comparisonData.at(-1)?.portfolio;
-    if (!officialRange || rawFinal === undefined || comparisonData.length < 2) return comparisonData;
-    const correction = officialRange.rate - rawFinal;
-    return comparisonData.map((item, index) => ({
-      ...item,
-      portfolio: item.portfolio + correction * (index / (comparisonData.length - 1)),
-    }));
-  }, [comparisonData, officialRange]);
+  }, [benchmarkKey, comparisonRange, dailyHistory, livePortfolio?.benchmarks, officialRange?.initialAssetValue]);
+  const displayedComparisonData = comparisonData;
   const comparisonSummary = displayedComparisonData.at(-1);
+  const displayedPortfolioRate = officialRange?.simpleRate ?? comparisonSummary?.portfolio;
   const benchmarkLabel = livePortfolio?.benchmarks?.[benchmarkKey]?.label ||
     ({ nasdaq: '纳斯达克', sp500: '标普 500', dow: '道琼斯' } as const)[benchmarkKey];
 
@@ -613,7 +591,7 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
             )}
             <div>
               <b>{config.account}</b>
-              <span>USD · TWR · 只读</span>
+              <span>USD · 简单加权 · 只读</span>
             </div>
           </div>
           {view === 'overview' && (
@@ -758,7 +736,7 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
                 ? `${monthRate >= 0 ? '+' : ''}${monthRate.toFixed(2)}%`
                 : '—'}
             </strong>
-            <small>真实日收益率几何链接</small>
+            <small>累计盈亏 ÷ 期初资产及净入金</small>
           </article>
           <article>
             <span>盈利 / 亏损日</span>
@@ -938,10 +916,12 @@ export default function PortfolioDashboard({ view }: { view: DashboardView }) {
           {displayedComparisonData.length && comparisonSummary ? (
             <>
               <div className="comparison-stats">
-                <span>我的组合 <b>{comparisonSummary.portfolio >= 0 ? '+' : ''}{comparisonSummary.portfolio.toFixed(2)}%</b></span>
+                <span>我的组合 <b>{displayedPortfolioRate !== undefined && displayedPortfolioRate >= 0 ? '+' : ''}{displayedPortfolioRate?.toFixed(2) ?? '—'}%</b></span>
                 <span>{benchmarkLabel} <b>{comparisonSummary.benchmark !== null && comparisonSummary.benchmark >= 0 ? '+' : ''}{comparisonSummary.benchmark?.toFixed(2) ?? '—'}%</b></span>
-                <span>超额收益 <b>{comparisonSummary.benchmark === null ? '—' : `${comparisonSummary.portfolio - comparisonSummary.benchmark >= 0 ? '+' : ''}${(comparisonSummary.portfolio - comparisonSummary.benchmark).toFixed(2)}%`}</b></span>
-                {officialRange && <span className="official-source">组合采用长桥官方 TWR</span>}
+                <span>超额收益 <b>{comparisonSummary.benchmark === null || displayedPortfolioRate === undefined ? '—' : `${displayedPortfolioRate - comparisonSummary.benchmark >= 0 ? '+' : ''}${(displayedPortfolioRate - comparisonSummary.benchmark).toFixed(2)}%`}</b></span>
+                {officialRange && <span>累计盈亏 <b>{officialRange.pnl >= 0 ? '+' : ''}{usd(officialRange.pnl)}</b></span>}
+                {officialRange && <span>时间加权 TWR <b>{officialRange.rate >= 0 ? '+' : ''}{officialRange.rate.toFixed(2)}%</b></span>}
+                <span className="official-source">橙线：简单加权收益</span>
               </div>
               <div className="comparison-legend" aria-label="图表颜色说明">
                 <span><i className="portfolio-line" />我的组合</span>
