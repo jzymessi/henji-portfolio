@@ -4,6 +4,10 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import process from 'node:process';
+import {
+  calculateIbkrRealizedPnl,
+  recordIbkrSessionRealized,
+} from '../lib/ibkr-realized.js';
 import { reconcileIbkrNavRollover } from '../lib/ibkr-rollover.js';
 import { validateLongbridgeDailyWindow } from '../lib/longbridge-daily.js';
 import { reconcileDailyCashFlows } from '../lib/portfolio-cashflows.js';
@@ -20,6 +24,7 @@ const port = Number(process.env.PORTFOLIO_BRIDGE_PORT || 4318);
 const projectRoot = path.resolve(import.meta.dirname, '..');
 const dataDir = path.join(projectRoot, '.data');
 const cachePath = path.join(dataDir, 'portfolio-cache.json');
+const ibkrRealizedLedgerPath = path.join(dataDir, 'ibkr-realized-live.json');
 const automaticRefreshIntervalMs = 15 * 60 * 1000;
 const enabledBrokers = new Set(
   (process.env.PORTFOLIO_BROKERS || 'ibkr')
@@ -81,7 +86,24 @@ async function loadIbkrLifetimePnl() {
   }
 }
 
-async function fetchIbkrFromTws(lifetime) {
+async function loadIbkrRealizedLedger() {
+  try {
+    return JSON.parse(await readFile(ibkrRealizedLedgerPath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+async function saveIbkrRealizedLedger(ledger) {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(
+    ibkrRealizedLedgerPath,
+    JSON.stringify(ledger, null, 2),
+    'utf8',
+  );
+}
+
+async function fetchIbkrFromTws(lifetime, realizedLedger) {
   const python =
     process.env.IBKR_TWS_PYTHON ||
     path.join(projectRoot, '.venv', 'bin', 'python');
@@ -91,11 +113,18 @@ async function fetchIbkrFromTws(lifetime) {
     { timeout: 25000, maxBuffer: 10 * 1024 * 1024 },
   );
   const snapshot = JSON.parse(stdout);
+  const sessionDate = usTradingDate();
+  const nextRealizedLedger = recordIbkrSessionRealized(
+    realizedLedger,
+    snapshot.positions || [],
+    sessionDate,
+  );
+  await saveIbkrRealizedLedger(nextRealizedLedger);
   return {
     connected: true,
     connection: `tws:${snapshot.port}`,
     updatedAt: new Date().toISOString(),
-    sessionDate: usTradingDate(),
+    sessionDate,
     sessionLabel: '美东交易日',
     accountId: snapshot.accountId,
     nav: number(snapshot.nav),
@@ -134,8 +163,10 @@ async function fetchIbkrFromTws(lifetime) {
                   ? 0
                   : (number(item.dailyPnl) / denominator) * 100;
               })(),
-        realizedPnlNet: number(
-          history.realizedPnlNet ?? item.sessionRealizedPnl,
+        realizedPnlNet: calculateIbkrRealizedPnl(
+          history,
+          nextRealizedLedger,
+          item,
         ),
       };
     }),
@@ -146,9 +177,12 @@ async function fetchIbkrFromTws(lifetime) {
 async function fetchIbkr() {
   if (!enabledBrokers.has('ibkr'))
     return { connected: false, disabled: true, positions: [] };
-  const lifetime = await loadIbkrLifetimePnl();
+  const [lifetime, realizedLedger] = await Promise.all([
+    loadIbkrLifetimePnl(),
+    loadIbkrRealizedLedger(),
+  ]);
   try {
-    return await fetchIbkrFromTws(lifetime);
+    return await fetchIbkrFromTws(lifetime, realizedLedger);
   } catch (error) {
     return { connected: false, error: error.message, positions: [] };
   }

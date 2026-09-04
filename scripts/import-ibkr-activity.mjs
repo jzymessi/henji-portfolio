@@ -56,6 +56,7 @@ let headers = [];
 const daily = [];
 const realizedBySymbol = new Map();
 let selectedAccountId = process.env.IBKR_ACCOUNT_ID || '';
+let reportEndDate = '';
 
 for (const row of rows) {
   if (!row.length) continue;
@@ -78,6 +79,10 @@ for (const row of rows) {
   const record = Object.fromEntries(
     headers.map((header, index) => [header, row[index]]),
   );
+  const reportDate = isoDate(
+    record.ToDate || record.ReportDate || record.TradeDate,
+  );
+  if (reportDate > reportEndDate) reportEndDate = reportDate;
   if (section === 'pnl') {
     const date = isoDate(record.ToDate || record.FromDate);
     const openingNav = numeric(record.StartingValue);
@@ -152,8 +157,9 @@ if (realizedBySymbol.size) {
     // The report may be the first historical import.
   }
   for (const [key, value] of realizedBySymbol) {
-    lifetime[key] = value;
-    lifetime[value.symbol] = value;
+    const imported = { ...value, asOfDate: reportEndDate };
+    lifetime[key] = imported;
+    lifetime[value.symbol] = imported;
   }
   await writeFile(lifetimePath, JSON.stringify(lifetime, null, 2), 'utf8');
 }

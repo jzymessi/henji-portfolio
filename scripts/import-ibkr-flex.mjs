@@ -39,20 +39,21 @@ function parseCsv(text) {
 }
 
 const rows = parseCsv(await readFile(path.resolve(source), 'utf8'));
-const headerIndex = rows.findIndex(
-  (row) =>
-    row.includes('Symbol') &&
-    (row.includes('Conid') || row.includes('ConidEx')),
-);
-if (headerIndex < 0)
-  throw new Error('Could not find an IBKR Flex Trades header');
-const headers = rows[headerIndex];
-const records = rows
-  .slice(headerIndex + 1)
-  .filter((row) => row.length === headers.length);
 const output = {};
+let headers = [];
+let tradesSection = false;
+let reportEndDate = '';
 
-for (const row of records) {
+for (const row of rows) {
+  if (row[0] === 'ClientAccountID') {
+    headers = row;
+    tradesSection =
+      row.includes('Symbol') &&
+      (row.includes('Conid') || row.includes('ConidEx')) &&
+      (row.includes('FifoPnlRealized') || row.includes('RealizedPnL'));
+    continue;
+  }
+  if (!tradesSection || row.length !== headers.length) continue;
   const record = Object.fromEntries(
     headers.map((header, index) => [header, row[index]]),
   );
@@ -66,8 +67,20 @@ for (const row of records) {
   const key = String(conid);
   output[key] ||= { symbol, realizedPnlNet: 0 };
   output[key].realizedPnlNet += realized - commission;
+  const rawDate = String(
+    record.TradeDate || record.ReportDate || record.DateTime || '',
+  );
+  const compactDate = rawDate.match(/\d{8}/)?.[0];
+  if (compactDate) {
+    const date = `${compactDate.slice(0, 4)}-${compactDate.slice(4, 6)}-${compactDate.slice(6, 8)}`;
+    if (date > reportEndDate) reportEndDate = date;
+  }
   output[symbol] = output[key];
 }
+
+if (!Object.keys(output).length)
+  throw new Error('Could not find an IBKR Flex Trades section');
+for (const item of new Set(Object.values(output))) item.asOfDate = reportEndDate;
 
 const dataDirectory = path.resolve('.data');
 await mkdir(dataDirectory, { recursive: true });
